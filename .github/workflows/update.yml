@@ -22,13 +22,61 @@ jobs:
           python-version: "3.12"
       - name: Generate all formats
         run: python scripts/convert.py
+      - name: Record successful check every 30 days or when outputs change
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          output = Path("output")
+          status_file = output / "check-status.json"
+
+          digest = hashlib.sha256()
+          for path in sorted(output.iterdir()):
+              if path.is_file() and path != status_file:
+                  digest.update(path.name.encode("utf-8") + b"\0")
+                  digest.update(path.read_bytes())
+                  digest.update(b"\0")
+          output_sha256 = digest.hexdigest()
+
+          previous = {}
+          if status_file.exists():
+              try:
+                  previous = json.loads(status_file.read_text(encoding="utf-8"))
+              except (OSError, ValueError):
+                  previous = {}
+
+          now = datetime.now(timezone.utc)
+          last = None
+          try:
+              last = datetime.fromisoformat(previous["last_successful_check_utc"].replace("Z", "+00:00"))
+          except (KeyError, AttributeError, TypeError, ValueError):
+              pass
+
+          age = now - last if last and last.tzinfo else None
+          recent = age is not None and timedelta(0) <= age < timedelta(days=30)
+          unchanged = previous.get("generated_output_sha256") == output_sha256
+          if recent and unchanged:
+              print("Upstream check succeeded; verification record is current.")
+          else:
+              upstream = json.loads((output / "metadata.json").read_text(encoding="utf-8"))["upstream"]
+              record = {
+                  "upstream": upstream,
+                  "last_successful_check_utc": now.isoformat(timespec="seconds"),
+                  "generated_output_sha256": output_sha256,
+              }
+              status_file.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+              print("Recorded successful regeneration for the 30-day activity window.")
+          PY
       - name: Commit if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add output/
           if git diff --cached --quiet; then
-            echo "No upstream changes."
+            echo "No upstream or verification changes."
           else
             git commit -m "chore: update BM7 BlockHTTPDNS"
             git push
